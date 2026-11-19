@@ -32,6 +32,8 @@ jobs:
       MODE: ${{ inputs.mode || 'run' }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      - run: echo "STARTED=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -119,9 +121,19 @@ jobs:
 
       - name: Keep schedule alive
         # GitHub turns off schedules after 60 days without repo activity; re-enabling once a day resets that.
-        if: always() && github.event_name == 'schedule'
+        if: always()
         continue-on-error: true
         run: |
-          if [ "$(date -u +%H%M)" \< "0010" ]; then
+          if [ "$(date -u +%H%M)" \< "0020" ]; then
             gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/bots.yml/enable"
           fi
+
+      # GitHub's own schedule is often late or skipped, so each run starts the next one 15 minutes
+      # after it began. The schedule above stays as a backup that restarts the chain if it ever breaks.
+      # Disabling the workflow stops the chain.
+      - name: Start the next run in 15 minutes
+        if: ${{ !cancelled() && env.MODE == 'run' }}
+        run: |
+          wait=$(( 900 - ($(date +%s) - STARTED) ))
+          if [ "$wait" -gt 0 ]; then sleep "$wait"; fi
+          gh workflow run bots.yml -R "$GITHUB_REPOSITORY" -f mode=run
