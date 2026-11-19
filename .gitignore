@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+config.json
+*.state.json
+state.json
+state/
+*.log
+*.pid
+session-*

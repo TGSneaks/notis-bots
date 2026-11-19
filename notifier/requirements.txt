@@ -1,0 +1,5 @@
+requests>=2.31
+yt-dlp>=2025.1.1
+Pillow>=10.0
+# only needed if instagram.enabled is true
+instaloader>=4.14

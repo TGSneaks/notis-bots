@@ -1,0 +1,102 @@
+name: Bots
+
+on:
+  # SCHEDULE
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "run = check and send; probe = check feeds only, send nothing, save nothing"
+        type: choice
+        options: [run, probe]
+        default: run
+      reseed:
+        description: "Ignore saved state and start from the STATE_SEED secret"
+        type: boolean
+        default: false
+
+# One run at a time, so two runs never send the same post or overwrite each other's state.
+concurrency:
+  group: bots
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write # to save state and keep the schedule from being auto-disabled
+
+jobs:
+  bots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      MODE: ${{ inputs.mode || 'run' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: "*/requirements.txt"
+
+      - name: Install
+        run: |
+          pip install -q requests "yt-dlp>=2025.1.1" "Pillow>=10.0"
+          command -v ffmpeg || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg > /dev/null)
+
+      - name: Write configs
+        env:
+          BOT_CONFIGS: ${{ secrets.BOT_CONFIGS }}
+        run: python ci.py write-configs
+
+      - name: Restore saved state
+        id: restore
+        if: ${{ !inputs.reseed }}
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: bot-state-${{ github.run_id }}
+          restore-keys: bot-state-
+
+      - name: Seed state (first run or reseed)
+        if: ${{ steps.restore.outputs.cache-matched-key == '' }}
+        env:
+          STATE_SEED: ${{ secrets.STATE_SEED }}
+        run: python ci.py seed
+
+      - run: python ci.py unpack
+
+      - name: Run bots
+        if: env.MODE == 'run'
+        run: python ci.py run
+
+      - name: Probe (sends nothing)
+        if: env.MODE == 'probe'
+        run: python ci.py probe
+
+      - name: Collect state
+        if: always() && env.MODE == 'run'
+        run: python ci.py pack
+
+      - name: Save state
+        if: always() && env.MODE == 'run' && hashFiles('state/**') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: bot-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Delete old saved states
+        if: always() && env.MODE == 'run'
+        continue-on-error: true
+        run: |
+          gh cache list -R "$GITHUB_REPOSITORY" --key bot-state- --sort created_at --order desc --limit 100 --json id -q '.[5:][].id' \
+            | xargs -r -n1 gh cache delete -R "$GITHUB_REPOSITORY"
+
+      - name: Keep schedule alive
+        # GitHub turns off schedules after 60 days without repo activity; re-enabling once a day resets that.
+        if: always() && github.event_name == 'schedule'
+        continue-on-error: true
+        run: |
+          if [ "$(date -u +%H%M)" \< "0010" ]; then
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/bots.yml/enable"
+          fi

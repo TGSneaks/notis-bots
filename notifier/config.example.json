@@ -1,0 +1,26 @@
+{
+  "telegram_bot_token": "123456789:ABCdefYourBotTokenFromBotFather",
+  "telegram_chat_id": "",
+
+  "tiktok": {
+    "enabled": true,
+    "targets": [
+      { "username": "first_tiktok_user",  "chat_id": "-1001111111111" },
+      { "username": "second_tiktok_user", "chat_id": "-1002222222222" }
+    ],
+    "poll_interval_seconds": 300
+  },
+
+  "instagram": {
+    "enabled": false,
+    "targets": [
+      { "username": "some_instagram_user", "chat_id": "-1001111111111" }
+    ],
+    "ig_username": "your_instagram_login_username",
+    "ig_password": "",
+    "poll_interval_seconds": 600
+  },
+
+  "send_as_files": false,
+  "notify_existing_on_first_run": false
+}
