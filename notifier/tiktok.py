@@ -28,6 +28,8 @@ TIKWM = "https://www.tikwm.com"
 EMBED_SAFETY_EVERY = 6  # read the post list at least every Nth check even if the count looks unchanged
 MEDIA_RETRIES = 3  # checks to wait for a post's media before sending a text-only alert
 STATE_RE = r'<script id="{}"[^>]*>(.*?)</script>'
+SEND_LIMIT = UPLOAD_LIMIT - 1024 * 1024  # leave room for the upload's form data, or Telegram answers 413
+TOO_BIG_NOTE = "⚠️ Video is too big to upload to Telegram. Tap the link to watch it."
 
 
 class TikTokError(Exception):
@@ -42,6 +44,7 @@ class TikTok:
         self.s = requests.Session()
         self.s.headers["User-Agent"] = UA
         self._last_tikwm = 0.0
+        self.too_large = False
 
     # ------------------------------------------------------------------ fetch
 
@@ -117,17 +120,21 @@ class TikTok:
     # ------------------------------------------------------------------ media
 
     def post_media(self, username, post_id, embed_post=None):
-        """Highest-quality media for a post: tikwm 1080p, then yt-dlp, then the embed's 720p/cover."""
+        """Highest-quality media for a post: tikwm 1080p, then yt-dlp, then the embed's 720p/cover.
+        Sets self.too_large when the video exists but no copy fits Telegram's upload limit."""
         url = f"https://www.tiktok.com/@{username}/video/{post_id}"
+        self.too_large = False
         try:
             d = self._tikwm("/api/", {"url": url, "hd": 1})
             return self._tikwm_media(d, f"tiktok_{post_id}")
         except Exception as e:
+            self.too_large |= "too large" in str(e)
             log.warning("tikwm failed for %s: %s", post_id, e)
 
         try:
             return self._ytdlp_media(url, post_id)
         except Exception as e:
+            self.too_large |= "too large" in str(e)
             log.warning("yt-dlp failed for %s: %s", post_id, e)
 
         if embed_post:
@@ -135,10 +142,15 @@ class TikTok:
                 if embed_post.get(key):
                     try:
                         data = download(embed_post[key], {"Referer": "https://www.tiktok.com/"})
-                        ext = "mp4" if is_video else "jpg"
-                        return [MediaItem(data, is_video, f"tiktok_{post_id}.{ext}")]
                     except Exception as e:
                         log.warning("embed %s download failed: %s", key, e)
+                        continue
+                    if is_video and len(data) > SEND_LIMIT:
+                        self.too_large = True
+                        log.warning("embed video for %s is too large for Telegram; sending the cover", post_id)
+                        continue
+                    ext = "mp4" if is_video else "jpg"
+                    return [MediaItem(data, is_video, f"tiktok_{post_id}.{ext}")]
         return []
 
     def _tikwm_media(self, d, prefix):
@@ -150,9 +162,9 @@ class TikTok:
             cover = d.get("origin_cover") or d.get("cover")
             return [MediaItem(download(self._abs(cover)), False, f"{prefix}.jpg")] if cover else []
         data = download(self._abs(src))
-        if len(data) > UPLOAD_LIMIT and d.get("play") and src != d.get("play"):
+        if len(data) > SEND_LIMIT and d.get("play") and src != d.get("play"):
             data = download(self._abs(d["play"]))  # smaller SD file still fits
-        if len(data) > UPLOAD_LIMIT:
+        if len(data) > SEND_LIMIT:
             raise TikTokError("video too large for Telegram")
         return [MediaItem(data, True, f"{prefix}.mp4", duration=d.get("duration"))]
 
@@ -178,7 +190,7 @@ class TikTok:
             if not files:
                 raise TikTokError("yt-dlp produced no file")
             data = files[0].read_bytes()
-        if len(data) > UPLOAD_LIMIT:
+        if len(data) > SEND_LIMIT:
             raise TikTokError("video too large for Telegram")
         return [MediaItem(data, True, f"tiktok_{post_id}.mp4",
                           best.get("width"), best.get("height"), info.get("duration"))]
@@ -199,7 +211,7 @@ class TikTok:
                 if fmt.get("ext") == "mp4" and fmt.get("vcodec") not in (None, "none")
                 and fmt.get("format_note") != "watermarked"
                 and (fmt.get("height") or 0) > dimensions[1]
-                and (fmt.get("filesize") or fmt.get("filesize_approx") or 0) <= UPLOAD_LIMIT
+                and (fmt.get("filesize") or fmt.get("filesize_approx") or 0) <= SEND_LIMIT
             ]
             if not formats:
                 return item
@@ -214,7 +226,7 @@ class TikTok:
                     return item
                 data = files[0].read_bytes()
             better_dimensions = video_dimensions(data)
-            if not better_dimensions or better_dimensions[1] <= dimensions[1] or len(data) > UPLOAD_LIMIT:
+            if not better_dimensions or better_dimensions[1] <= dimensions[1] or len(data) > SEND_LIMIT:
                 return item
             log.info("@%s story %s: using %dx%d source instead of %dx%d",
                      username, story_id, *better_dimensions, *dimensions)
@@ -337,7 +349,7 @@ class TikTok:
                     media = self._tikwm_media(raw, f"story_{sid}")
                     if len(media) == 1 and media[0].is_video:
                         video = self._higher_quality_story(username, sid, media[0])
-                        filled, dimensions = fill_story_video(video.data, video.duration, UPLOAD_LIMIT)
+                        filled, dimensions = fill_story_video(video.data, video.duration, SEND_LIMIT)
                         if dimensions:
                             video = MediaItem(filled, True, video.name, *dimensions, video.duration)
                         media = [video]
@@ -364,23 +376,36 @@ class TikTok:
         """Sends the post. Returns False (nothing sent) when media failed and it's worth retrying later."""
         pid = post["id"]
         media = self.post_media(username, pid, post)
-        if not media and attempts < MEDIA_RETRIES:
+        too_large = self.too_large and not (media and media[0].is_video)
+        if not media and not too_large and attempts < MEDIA_RETRIES:
             log.warning("@%s post %s: no media yet (attempt %d), retrying next check", username, pid, attempts + 1)
             return False
         desc = html_escape(post.get("desc") or "")
         if len(desc) > 600:
             desc = desc[:600] + "…"
-        kind = "photo slideshow" if media and not media[0].is_video else "video"
-        cap = (
-            f"🆕 <b>{username}</b> posted a new TikTok ({kind})\n"
-            f"🕒 {_fmt_ts(int(pid) >> 32)}\n"
-            f"https://www.tiktok.com/@{username}/video/{pid}"
-            + (f"\n\n{desc}" if desc else "")
-        )
-        if media:
-            tg.media(media, cap)
-        else:
-            tg.text(cap)
+        kind = "photo slideshow" if media and not media[0].is_video and not too_large else "video"
+
+        def caption(note):
+            return (
+                f"🆕 <b>{username}</b> posted a new TikTok ({kind})\n"
+                f"🕒 {_fmt_ts(int(pid) >> 32)}\n"
+                f"https://www.tiktok.com/@{username}/video/{pid}"
+                + (f"\n{note}" if note else "")
+                + (f"\n\n{desc}" if desc else "")
+            )
+
+        note = TOO_BIG_NOTE if too_large else ""
+        if not media:
+            tg.text(caption(note))
+            return True
+        try:
+            tg.media(media, caption(note))
+        except RuntimeError as e:
+            if "413" not in str(e):
+                raise
+            # Telegram refused the file as too large: send the alert without it instead of retrying every check
+            log.warning("@%s post %s: Telegram says the upload is too large; sending the link only", username, pid)
+            tg.text(caption(TOO_BIG_NOTE))
         return True
 
 
