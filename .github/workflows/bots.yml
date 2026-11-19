@@ -85,6 +85,12 @@ jobs:
 
       - run: python ci.py unpack
 
+      - name: Add topics made elsewhere
+        if: ${{ steps.restore.outputs.cache-matched-key != '' }}
+        env:
+          STATE_SEED: ${{ secrets.STATE_SEED }}
+        run: python ci.py merge-topics
+
       - name: Run bots
         if: env.MODE == 'run'
         run: python ci.py run

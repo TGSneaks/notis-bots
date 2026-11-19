@@ -3,6 +3,7 @@
   python ci.py write-configs   BOT_CONFIGS secret (JSON: path -> file content) -> config files
   python ci.py seed            STATE_SEED secret (base64 zip) -> state/
   python ci.py unpack          state/ -> bot folders
+  python ci.py merge-topics    add topic IDs from STATE_SEED that saved state lacks
   python ci.py pack            bot folders -> state/
   python ci.py run             one check of every bot (TikTok + each news config)
   python ci.py probe           check feeds and TikTok without sending anything
@@ -59,6 +60,26 @@ def seed():
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(z.read(name))
             print(f"Seeded {name}")
+
+
+def merge_topics():
+    """Adds Telegram topic IDs from STATE_SEED that the saved state doesn't have yet (e.g. made by the PC bot)."""
+    raw = base64.b64decode(os.environ.get("STATE_SEED", ""))
+    if not raw:
+        return
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        for name in z.namelist():
+            seed_topics = json.loads(z.read(name)).get("_topics")
+            path = ROOT / name
+            if not seed_topics or not path.exists():
+                continue
+            state = json.loads(path.read_text(encoding="utf-8"))
+            topics = state.setdefault("_topics", {})
+            added = {k: v for k, v in seed_topics.items() if k not in topics}
+            if added:
+                topics.update(added)
+                path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+                print(f"{name}: added topics {', '.join(added)}")
 
 
 def unpack():
@@ -120,7 +141,7 @@ def probe():
 
 
 if __name__ == "__main__":
-    commands = {"write-configs": write_configs, "seed": seed, "unpack": unpack, "pack": pack, "run": run, "probe": probe}
+    commands = {"write-configs": write_configs, "seed": seed, "merge-topics": merge_topics, "unpack": unpack, "pack": pack, "run": run, "probe": probe}
     if len(sys.argv) != 2 or sys.argv[1] not in commands:
         raise SystemExit(__doc__)
     commands[sys.argv[1]]()
