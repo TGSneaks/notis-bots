@@ -1,7 +1,8 @@
 name: Bots
 
 on:
-  # SCHEDULE
+  schedule:
+    - cron: "*/15 * * * *" # TikTok checks each account about every 15 minutes, same as on the PC
   workflow_dispatch:
     inputs:
       mode:

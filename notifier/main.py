@@ -14,7 +14,7 @@ import sys
 import time
 from pathlib import Path
 
-from telegram import Telegram
+from telegram import Telegram, TopicGone
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
@@ -92,19 +92,40 @@ def ensure_topics(cfg, platforms, tg, state):
             if topic:
                 continue
             key = f"{chat}|{name}|{user}"
-            if key not in known:
-                title = f"{user} ({name})" if len(platforms) > 1 else user
-                known[key] = tg.for_chat(chat).create_topic(title)
-                save_state(state)
-                log.info("[%s] created topic '%s' in %s", name, title, chat)
-            routes[user] = (chat, known[key])
+            if key in known and not tg.for_chat(chat).topic_exists(known[key]):
+                log.warning("[%s] @%s's topic %s was deleted in Telegram - making a new one", name, user, known[key])
+                del known[key]
+            if key in known:
+                routes[user] = (chat, known[key])
+            else:
+                new_topic(platforms, name, user, chat, tg, state)
 
 
-def run_target(name, platform, username, routes, tg, state, notify_existing):
+def new_topic(platforms, name, user, chat, tg, state):
+    """Creates a topic for one username, remembers it and routes the username to it."""
+    title = f"{user} ({name})" if len(platforms) > 1 else user
+    topic = tg.for_chat(chat).create_topic(title)
+    state.setdefault("_topics", {})[f"{chat}|{name}|{user}"] = topic
+    save_state(state)
+    log.info("[%s] created topic '%s' in %s", name, title, chat)
+    platforms[name][1][user] = (chat, topic)
+
+
+def run_target(platforms, name, username, tg, state, notify_existing):
     """Checks one target. Returns True if it failed."""
+    platform, routes = platforms[name]
     pstate = state.setdefault(name, {})
     try:
-        platform.check(tg.for_chat(*routes[username]), username, pstate, notify_existing)
+        try:
+            platform.check(tg.for_chat(*routes[username]), username, pstate, notify_existing)
+        except TopicGone:
+            chat, topic = routes[username]
+            if state.get("_topics", {}).get(f"{chat}|{name}|{username}") != topic:
+                raise  # topic_id set by hand in config.json - leave it alone
+            # Unsent posts stay unseen, so checking again sends them to the new topic
+            log.warning("[%s] @%s's topic %s was deleted in Telegram - making a new one", name, username, topic)
+            new_topic(platforms, name, username, chat, tg, state)
+            platform.check(tg.for_chat(*routes[username]), username, pstate, notify_existing)
         return False
     except Exception as e:
         log.error("[%s] @%s check failed: %s", name, username, e, exc_info=log.isEnabledFor(logging.DEBUG))
@@ -187,8 +208,8 @@ def main():
             target = (name, username)
             if now < next_due[target]:
                 continue
-            p, routes = platforms[name]
-            failed = run_target(name, p, username, routes, tg, state, notify_existing)
+            p = platforms[name][0]
+            failed = run_target(platforms, name, username, tg, state, notify_existing)
             backoff[target] = min(backoff[target] * 2 or 300, 3600) if failed else 0
             wait = p.poll_interval + random.uniform(0, p.poll_interval * 0.2) + backoff[target]
             next_due[target] = time.time() + wait

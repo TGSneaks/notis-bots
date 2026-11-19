@@ -69,11 +69,26 @@ class TikTok:
         }
 
     def latest_posts(self, username):
-        """Newest-first list of the latest ~10 posts from the official creator embed."""
-        state = self._page_state(f"https://www.tiktok.com/embed/@{username}", "__FRONTITY_CONNECT_STATE__")
-        data = state.get("source", {}).get("data", {}).get(f"/embed/@{username}", {})
-        posts = data.get("videoList") or []
+        """Newest-first list of the latest ~10 posts from the official creator embed, or from yt-dlp's
+        profile listing when the embed is rate limited (it 429s often)."""
+        try:
+            state = self._page_state(f"https://www.tiktok.com/embed/@{username}", "__FRONTITY_CONNECT_STATE__")
+            data = state.get("source", {}).get("data", {}).get(f"/embed/@{username}", {})
+            posts = data.get("videoList") or []
+        except Exception as e:
+            log.info("embed post list unavailable for @%s (%s); using yt-dlp", username, e)
+            posts = self._ytdlp_posts(username)
         return sorted(posts, key=lambda p: int(p["id"]), reverse=True)
+
+    @staticmethod
+    def _ytdlp_posts(username):
+        import yt_dlp
+
+        opts = {"quiet": True, "no_warnings": True, "extract_flat": True, "playlistend": 10}
+        with yt_dlp.YoutubeDL(opts) as y:
+            info = y.extract_info(f"https://www.tiktok.com/@{username}", download=False)
+        return [{"id": str(e["id"]), "desc": e.get("description") or e.get("title") or ""}
+                for e in info.get("entries") or [] if str(e.get("id", "")).isdigit()]
 
     def _tikwm(self, path, payload):
         for attempt in range(2):
@@ -245,9 +260,9 @@ class TikTok:
         # ---- private <-> public
         if not first_run and st["private"] != prof["private"]:
             if prof["private"]:
-                tg.text(f"🔒 <b>@{username}</b> just went <b>private</b> on TikTok.\n{link}")
+                tg.text(f"🔒 <b>{username}</b> just went <b>private</b> on TikTok.\n{link}")
             else:
-                tg.text(f"🔓 <b>@{username}</b> is now <b>public</b> on TikTok!\n{link}")
+                tg.text(f"🔓 <b>{username}</b> is now <b>public</b> on TikTok!\n{link}")
         st["private"] = prof["private"]
 
         if prof["private"]:
@@ -261,9 +276,10 @@ class TikTok:
         # ---- posts
         # The embed page is rate limited (429) if hit every check, so only read it when the profile's
         # video count changed, when there's a pending media retry, or every few checks as a safety net.
+        # Accounts whose count doesn't move per post (big ones show a rounded count) are read every check.
         skipped = st.get("embed_skips", 0)
         if ("seen_posts" in st and prof["video_count"] is not None
-                and prof["video_count"] == st.get("video_count")
+                and prof["video_count"] == st.get("video_count") and not st.get("count_unreliable")
                 and not st.get("media_retries") and skipped < EMBED_SAFETY_EVERY):
             st["embed_skips"] = skipped + 1
             return
@@ -272,7 +288,15 @@ class TikTok:
         notify_posts = "seen_posts" in st or (first_run and notify_existing)
         seen = set(st.get("seen_posts", []))
         retries = st.setdefault("media_retries", {})
-        new = [p for p in self.latest_posts(username) if p["id"] not in seen]
+        # Post IDs grow over time, so anything older than the newest seen post (a pinned video, say)
+        # isn't new - unless it's still waiting for its media
+        newest = max((int(s) for s in seen), default=0)
+        new = [p for p in self.latest_posts(username)
+               if p["id"] not in seen and (int(p["id"]) > newest or p["id"] in retries)]
+        if (seen and not st.get("count_unreliable") and prof["video_count"] == st.get("video_count")
+                and any(p["id"] not in retries for p in new)):
+            st["count_unreliable"] = True
+            log.info("@%s posted without its video count changing - reading its post list every check", username)
         for post in reversed(new):  # oldest first
             pid = post["id"]
             if notify_posts and not self._send_post(tg, username, post, retries.get(pid, 0)):
@@ -321,7 +345,7 @@ class TikTok:
                     log.warning("story media download failed: %s", e)
                     media = []
                 when = _fmt_ts(created)
-                cap = f"📸 <b>@{username}</b> posted a new TikTok story\n🕒 {when}\n{_story_link(username)}"
+                cap = f"📸 <b>{username}</b> posted a new TikTok story\n🕒 {when}\n{_story_link(username)}"
                 if media:
                     tg.media(media, cap)
                 else:
@@ -333,7 +357,7 @@ class TikTok:
 
         # No story media available: still say a story went up (once per story session)
         if not sent_any and not had_flag and notify:
-            tg.text(f"📸 <b>@{username}</b> has a new TikTok story.\n{_story_link(username)}")
+            tg.text(f"📸 <b>{username}</b> has a new TikTok story.\n{_story_link(username)}")
         st["story_flag"] = True
 
     def _send_post(self, tg, username, post, attempts=0):
@@ -348,7 +372,7 @@ class TikTok:
             desc = desc[:600] + "…"
         kind = "photo slideshow" if media and not media[0].is_video else "video"
         cap = (
-            f"🆕 <b>@{username}</b> posted a new TikTok ({kind})\n"
+            f"🆕 <b>{username}</b> posted a new TikTok ({kind})\n"
             f"🕒 {_fmt_ts(int(pid) >> 32)}\n"
             f"https://www.tiktok.com/@{username}/video/{pid}"
             + (f"\n\n{desc}" if desc else "")

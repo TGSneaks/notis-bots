@@ -9,6 +9,7 @@ import requests
 TG_API = "https://api.telegram.org/bot{token}/{method}"
 CAPTION_LIMIT = 1024
 UPLOAD_LIMIT = 50 * 1024 * 1024  # Bot API upload limit
+TOPIC_GONE_ERRORS = ("message thread not found", "topic_deleted", "topic_id_invalid")
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
@@ -27,6 +28,10 @@ def download(url, headers=None):
     r = requests.get(url, headers=h, timeout=180)
     r.raise_for_status()
     return r.content
+
+
+class TopicGone(RuntimeError):
+    """The forum topic being sent to no longer exists (deleted in Telegram)."""
 
 
 class MediaItem:
@@ -75,6 +80,8 @@ class Telegram:
                 time.sleep(wait + 1)
                 continue
             if not r.ok:
+                if self.topic_id and any(e in r.text.lower() for e in TOPIC_GONE_ERRORS):
+                    raise TopicGone(f"topic {self.topic_id} no longer exists")
                 log.error("Telegram %s failed: %s", method, r.text)
                 raise RuntimeError(f"Telegram {method} failed: HTTP {r.status_code}")
             body = r.json()
@@ -139,6 +146,23 @@ class Telegram:
         if not body.get("ok"):
             raise RuntimeError(f"couldn't create topic '{name}': {body.get('description')}")
         return body["result"]["message_thread_id"]
+
+    def delete_topic(self):
+        """Deletes this forum topic and everything in it (bot needs 'Manage Topics'). Already gone is fine."""
+        try:
+            self._call("deleteForumTopic", {"chat_id": self.chat_id})
+        except TopicGone:
+            pass
+
+    def topic_exists(self, topic_id):
+        """False only if the topic was deleted. Probes the topic's opening message with an edit that
+        Telegram always refuses ("can't be edited" vs "not found"), so nothing in the chat changes."""
+        try:
+            r = requests.post(TG_API.format(token=self.token, method="editMessageReplyMarkup"),
+                              data={"chat_id": self.chat_id, "message_id": topic_id}, timeout=30)
+        except requests.RequestException:
+            return True  # can't tell - keep the topic rather than make a duplicate
+        return "message to edit not found" not in r.text.lower()
 
     def list_chats(self):
         """Chats/channels the bot has recently seen, from getUpdates. Returns list of (id, type, title)."""

@@ -94,9 +94,9 @@ class Instagram:
         was_private = st.get("is_private")
         if was_private is not None and was_private != profile.is_private:
             if profile.is_private:
-                tg.text(f"🔒 <b>@{username}</b> just went <b>private</b> on Instagram.\n{link}")
+                tg.text(f"🔒 <b>{username}</b> just went <b>private</b> on Instagram.\n{link}")
             else:
-                tg.text(f"🔓 <b>@{username}</b> is now <b>public</b> on Instagram!\n{link}")
+                tg.text(f"🔓 <b>{username}</b> is now <b>public</b> on Instagram!\n{link}")
         st["is_private"] = profile.is_private
 
         if profile.is_private and not profile.followed_by_viewer:
@@ -121,7 +121,7 @@ class Instagram:
                 entries = [(item.video_url, True)] if item.is_video else [(item.url, False)]
                 items, failed = self._collect(entries, f"ig_story_{item.mediaid}")
                 cap = (
-                    f"📸 <b>@{username}</b> posted a new Instagram story\n"
+                    f"📸 <b>{username}</b> posted a new Instagram story\n"
                     f"🕒 {item.date_utc:%Y-%m-%d %H:%M} UTC\n"
                     f"https://www.instagram.com/stories/{username}/{item.mediaid}/"
                 )
@@ -144,7 +144,7 @@ class Instagram:
                 if len(body) > 600:
                     body = body[:600] + "…"
                 cap = (
-                    f"🆕 <b>@{username}</b> posted on Instagram ({kind})\n"
+                    f"🆕 <b>{username}</b> posted on Instagram ({kind})\n"
                     f"🕒 {post.date_utc:%Y-%m-%d %H:%M} UTC\n"
                     f"https://www.instagram.com/p/{post.shortcode}/"
                     + (f"\n\n{body}" if body else "")
