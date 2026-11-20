@@ -87,7 +87,7 @@ jobs:
 
       - run: python ci.py unpack
 
-      - name: Add topics made elsewhere
+      - name: Add state and topics made elsewhere
         if: ${{ steps.restore.outputs.cache-matched-key != '' }}
         env:
           STATE_SEED: ${{ secrets.STATE_SEED }}

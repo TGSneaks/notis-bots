@@ -3,7 +3,7 @@
   python ci.py write-configs   BOT_CONFIGS secret (JSON: path -> file content) -> config files
   python ci.py seed            STATE_SEED secret (base64 zip) -> state/
   python ci.py unpack          state/ -> bot folders
-  python ci.py merge-topics    add topic IDs from STATE_SEED that saved state lacks
+  python ci.py merge-topics    after a restore: copy state files only STATE_SEED has, add its missing topic IDs
   python ci.py pack            bot folders -> state/
   python ci.py run             one check of every bot (TikTok + each news config)
   python ci.py probe           check feeds and TikTok without sending anything
@@ -63,15 +63,26 @@ def seed():
 
 
 def merge_topics():
-    """Adds Telegram topic IDs from STATE_SEED that the saved state doesn't have yet (e.g. made by the PC bot)."""
+    """Runs when saved state was restored, so `seed` was skipped. Brings in what STATE_SEED has and saved state lacks:
+    a state file missing from saved state (e.g. a bot just moved from the PC) is copied in whole; for files that
+    already exist, only Telegram topic IDs (`_topics`) they don't have yet are added."""
     raw = base64.b64decode(os.environ.get("STATE_SEED", ""))
     if not raw:
         return
     with zipfile.ZipFile(io.BytesIO(raw)) as z:
         for name in z.namelist():
-            seed_topics = json.loads(z.read(name)).get("_topics")
-            path = ROOT / name
-            if not seed_topics or not path.exists():
+            path = (ROOT / name).resolve()
+            if ROOT not in path.parents or path.suffix != ".json":
+                raise SystemExit(f"Bad path in seed: {name}")
+            data = z.read(name)
+            if not path.exists():
+                json.loads(data)  # refuse to copy a corrupt file
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+                print(f"{name}: not in saved state, copied from STATE_SEED")
+                continue
+            seed_topics = json.loads(data).get("_topics")
+            if not seed_topics:
                 continue
             state = json.loads(path.read_text(encoding="utf-8"))
             topics = state.setdefault("_topics", {})
