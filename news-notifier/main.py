@@ -8,6 +8,7 @@ import os
 import re
 import socket
 import time
+import unicodedata
 import xml.etree.ElementTree as ET
 import zlib
 from datetime import datetime, timezone
@@ -83,6 +84,7 @@ def load_config():
             label_for[account] = label
     cfg["label_for"] = label_for
     cfg["fixed_label"] = set(cfg.get("account_labels", {}))
+    cfg["filters_for"] = compile_filters(cfg.get("filters", []), accounts)
     cfg["poll_interval_seconds"] = max(60, int(cfg.get("poll_interval_seconds", 180)))
     cfg["feed_count"] = min(100, max(1, int(cfg.get("feed_count", 50))))
     return cfg
@@ -446,6 +448,37 @@ SALE = re.compile(
     r"|holiday|Halloween|Lunar New Year) (?:Store )?sale\b|"
     r"\b(?:Black Friday|Cyber Monday|Prime Day)\b|\bprice (?:drop|cut)\b|\blowest price\b",
     re.I)
+
+
+def _plain(text):
+    """Lowercase, accents removed and curly quotes straightened, so "Procházka" matches "prochazka"."""
+    text = unicodedata.normalize("NFKD", text.replace("’", "'").replace("‘", "'"))
+    return "".join(c for c in text if not unicodedata.combining(c))
+
+
+def compile_filters(filters, accounts):
+    """Config "filters": [{"accounts": [...], "reason": "...", "require": [regex], "drop": [regex]}].
+    A post from a listed account is sent only if it matches a "require" pattern and no "drop" pattern."""
+    known = {a.lower(): a for a in accounts}
+    out = {}
+    for f in filters:
+        def join(patterns):
+            return re.compile("|".join(f"(?:{_plain(p)})" for p in patterns), re.I | re.M) if patterns else None
+        rule = (f.get("reason", "filtered"), join(f.get("require", [])), join(f.get("drop", [])))
+        for account in f.get("accounts", []):
+            if account.lower() not in known:
+                raise ValueError(f"filters: @{account} is not one of the watched accounts")
+            out.setdefault(known[account.lower()], []).append(rule)
+    return out
+
+
+def filter_reason(filters, text):
+    plain = _plain(text)
+    words = LINK.sub(" ", plain)  # "require" ignores links: article URLs name other fights
+    for reason, require, drop in filters:
+        if (require and not require.search(words)) or (drop and drop.search(plain)):
+            return reason
+    return ""
 
 
 def skip_reason(text):
@@ -1075,7 +1108,7 @@ def check_account(session, tg, cfg, state, account):
         key=lambda p: (p["timestamp"], int(p["id"])),
     )
     for post in new_posts:
-        reason = skip_reason(post["text"])
+        reason = skip_reason(post["text"]) or filter_reason(cfg.get("filters_for", {}).get(account, []), post["text"])
         if reason:
             log.info("@%s skipped (%s) %s", account, reason, post["url"])
         else:
@@ -1089,11 +1122,11 @@ def check_account(session, tg, cfg, state, account):
                     log.exception("@%s picture lookup failed; sending without one", account)
                     post["media"] = []
             tg.post(topic_id, account, post)
+            log.info("@%s posted %s", account, post["url"])
         seen.add(post["id"])
         account_state["seen_ids"] = (account_state.get("seen_ids", []) + [post["id"]])[-500:]
         account_state["watermark"] = max(account_state.get("watermark", 0), post["timestamp"])
         save_state(state)
-        log.info("@%s posted %s", account, post["url"])
     save_state(state)
 
 
@@ -1168,6 +1201,12 @@ def main():
         state["chat_id"] = chat_id
         state["topics"] = {}
         save_state(state)
+    # Accounts removed from the config: forget them, so re-adding one later gets a fresh topic.
+    for account in [a for a in state.get("topics", {}) if a not in cfg["accounts"]]:
+        state["topics"].pop(account)
+        state.get("accounts", {}).pop(account, None)
+        save_state(state)
+        log.info("Forgot removed account @%s", account)
     for account in cfg["accounts"]:
         if account not in state.setdefault("topics", {}):
             state["topics"][account] = tg.create_topic(account)

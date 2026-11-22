@@ -19,7 +19,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 LOCAL = HERE.parent
-NEWS_CONFIGS = ["config.json", "creator-sports.json", "tech-ai.json", "anime.json"]
+NEWS_CONFIGS = ["config.json", "creator-sports.json", "tech-ai.json", "anime.json", "online-news.json"]
 
 
 def set_secret(name, value):
@@ -32,7 +32,11 @@ def configs(tiktok_dir, news):
     for name in NEWS_CONFIGS if news else []:
         path = LOCAL / "news-notifier" / name
         if path.exists():
-            out[f"news-notifier/{name}"] = json.loads(path.read_text(encoding="utf-8"))
+            cfg = json.loads(path.read_text(encoding="utf-8"))
+            if not cfg.get("telegram_chat_id"):
+                print(f"Skipped {name}: no telegram_chat_id yet")  # the cloud run would fail on it
+                continue
+            out[f"news-notifier/{name}"] = cfg
     return out
 
 
