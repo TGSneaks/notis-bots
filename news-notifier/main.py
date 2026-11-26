@@ -11,7 +11,7 @@ import time
 import unicodedata
 import xml.etree.ElementTree as ET
 import zlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from io import BytesIO
@@ -82,6 +82,9 @@ def load_config():
     for account, label in cfg.get("account_labels", {}).items():
         if account in label_for:
             label_for[account] = label
+    for account, emoji in cfg.get("account_emoji", {}).items():
+        if account in emoji_for:
+            emoji_for[account] = emoji
     cfg["label_for"] = label_for
     cfg["fixed_label"] = set(cfg.get("account_labels", {}))
     cfg["filters_for"] = compile_filters(cfg.get("filters", []), accounts)
@@ -265,13 +268,14 @@ class Telegram:
     def post(self, topic_id, account, post):
         emoji = self.emoji.get(account, "📰")
         topic = headline(post["text"], self.labels.get(account, ""), account in self.fixed)
+        button = post.get("button", "Open on X ↗")
         base = {
             "chat_id": self.chat_id,
             "message_thread_id": topic_id,
             "parse_mode": "HTML",
-            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "Open on X ↗", "url": post["url"]}]]}),
+            "reply_markup": json.dumps({"inline_keyboard": [[{"text": button, "url": post["url"]}]]}),
         }
-        caption = format_post(account, post, emoji, topic)
+        caption = post.get("caption") or format_post(account, post, emoji, topic)
         self.download_deadline = time.monotonic() + 60
         self.downloaded = {}
         # Best visual first. Tweet media goes by URL; other images are downloaded and uploaded,
@@ -280,7 +284,7 @@ class Telegram:
             try:
                 if kind == "album":
                     # Albums can't carry a button, so the X link goes in the caption instead.
-                    linked = f'{caption}\n<a href="{html.escape(post["url"], quote=True)}">Open on X ↗</a>'
+                    linked = f'{caption}\n<a href="{html.escape(post["url"], quote=True)}">{html.escape(button)}</a>'
                     items = [{"type": "photo", "media": u, **({"caption": linked, "parse_mode": "HTML"} if i == 0 else {})}
                              for i, u in enumerate(url)]
                     self.call("sendMediaGroup", {"chat_id": self.chat_id, "message_thread_id": topic_id,
@@ -319,7 +323,8 @@ class Telegram:
                 log.warning("Skipping album picture %s: %s", url, exc)
         if len(files) < 2:
             raise RuntimeError("fewer than two album pictures loaded")
-        linked = f'{caption}\n<a href="{html.escape(post["url"], quote=True)}">Open on X ↗</a>'
+        button = html.escape(post.get("button", "Open on X ↗"))
+        linked = f'{caption}\n<a href="{html.escape(post["url"], quote=True)}">{button}</a>'
         items = [{"type": "photo", "media": f"attach://{key}",
                   **({"caption": linked, "parse_mode": "HTML"} if i == 0 else {})}
                  for i, key in enumerate(files)]
@@ -1130,6 +1135,190 @@ def check_account(session, tg, cfg, state, account):
     save_state(state)
 
 
+# --- Extra topics that aren't X accounts: new-episode alerts and a nightly NBA scores digest ---
+
+EXTRA_HEADERS = {"User-Agent": "news-notifier/1.0"}  # ESPN's CDN refuses user agents that say "bot"
+EPISODE_FEED = "https://raw.githubusercontent.com/RockinChaos/AniSchedule/master/raw/{track}-episode-feed.json"
+ANILIST = "https://graphql.anilist.co"
+STREAM_SITES = ("Crunchyroll", "Netflix", "HIDIVE", "Hulu", "Disney Plus", "Amazon Prime Video")
+ESPN_SCORES = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
+ESPN_STANDINGS = "https://site.api.espn.com/apis/v2/sports/basketball/nba/standings"
+
+
+def extra_topic(tg, state, key, name):
+    topics = state.setdefault("extra_topics", {})
+    if key not in topics:
+        topics[key] = tg.create_topic(name)
+        save_state(state)
+        log.info("Created topic %s", name)
+    return topics[key]
+
+
+def latest_episodes(session, tracks):
+    """{"<AniList id>:<dub|sub>": highest aired episode} from AniSchedule's episode feeds."""
+    latest = {}
+    for track in tracks:
+        response = session.get(EPISODE_FEED.format(track=track), timeout=60, headers=EXTRA_HEADERS)
+        response.raise_for_status()
+        for entry in response.json():
+            episode = (entry.get("episode") or {}).get("aired")
+            key = f"{entry.get('id')}:{track}"
+            if isinstance(episode, (int, float)) and episode > latest.get(key, 0):
+                latest[key] = episode
+    return latest
+
+
+def anilist_show(session, anilist_id):
+    query = ("query($id:Int){Media(id:$id){title{english romaji} coverImage{extraLarge} bannerImage siteUrl "
+             "externalLinks{site url type}}}")
+    response = session.post(ANILIST, json={"query": query, "variables": {"id": anilist_id}},
+                            timeout=20, headers=EXTRA_HEADERS)
+    response.raise_for_status()
+    return response.json()["data"]["Media"]
+
+
+def check_episodes(session, tg, cfg, state):
+    """Post in the group's episodes topic when a followed show gets a new dub or sub episode."""
+    settings = cfg.get("episodes") or {}
+    shows = settings.get("shows") or []
+    if not shows:
+        return
+    latest = latest_episodes(session, sorted({show["track"] for show in shows}))
+    seen = state.setdefault("episodes", {})
+    for show in shows:
+        key = f"{show['anilist_id']}:{show['track']}"
+        newest = latest.get(key)
+        if newest is None:
+            continue
+        if key not in seen:  # first look: remember where the show is, announce only what comes after
+            seen[key] = newest
+            save_state(state)
+            log.info("%s %s baseline: episode %s", show["name"], show["track"], newest)
+            continue
+        if newest <= seen[key]:
+            continue
+        topic_id = extra_topic(tg, state, "episodes", settings.get("topic", "New Episodes"))
+        try:
+            info = anilist_show(session, show["anilist_id"])
+        except (requests.RequestException, KeyError, ValueError, TypeError):
+            info = {}
+        links = {link.get("site"): link.get("url") for link in info.get("externalLinks") or [] if link.get("url")}
+        site = next((s for s in STREAM_SITES if s in links), None)
+        first = int(seen[key]) + 1
+        number = f"Episode {int(newest)}" if first >= newest else f"Episodes {first}–{int(newest)}"
+        kind = "English dub" if show["track"] == "dub" else "Subtitled"
+        where = f" on {site}" if site else ""
+        name = show["name"]
+        caption = (f"📺 <b>{html.escape(name.upper())}</b> · {html.escape(show['track'].capitalize())}\n"
+                   f"<blockquote>{html.escape(f'{number} ({kind}) is out now{where}')}</blockquote>")
+        cover = (info.get("coverImage") or {}).get("extraLarge") or info.get("bannerImage")
+        post = {"id": f"{key}:{newest}", "text": f"{name} {number}", "caption": caption,
+                "url": links.get(site) or info.get("siteUrl") or f"https://anilist.co/anime/{show['anilist_id']}",
+                "button": f"Watch on {site} ↗" if site else "Open on AniList ↗",
+                "media": [("photo", cover), ("upload", cover)] if cover else []}
+        tg.post(topic_id, name, post)
+        seen[key] = newest
+        save_state(state)
+        log.info("%s %s episode %s announced", name, show["track"], newest)
+
+
+def _espn_stat(entry, name):
+    return next((s.get("displayValue") for s in entry.get("stats", []) if s.get("name") == name), "")
+
+
+def nba_standings(session):
+    data = session.get(ESPN_STANDINGS, timeout=20, headers=EXTRA_HEADERS).json()
+    lines = []
+    for conference in data.get("children", []):
+        entries = conference.get("standings", {}).get("entries", [])
+        entries = sorted(entries, key=lambda e: float(next(
+            (s.get("value") or 99 for s in e.get("stats", []) if s.get("name") == "playoffSeed"), 99)))
+        short = conference.get("abbreviation") or conference.get("name", "")[:4]
+        teams = [f"{_espn_stat(e, 'playoffSeed')}. {e['team']['abbreviation']} {_espn_stat(e, 'wins')}-"
+                 f"{_espn_stat(e, 'losses')}" for e in entries[:10]]
+        if teams:
+            lines.append(f"{short}: " + " · ".join(teams))
+    return lines
+
+
+def nba_digest(session, day, force=False):
+    """Caption for one US date's games, or None while any game is unfinished (unless forced) or there were none."""
+    data = session.get(ESPN_SCORES, params={"dates": day.strftime("%Y%m%d")}, timeout=20,
+                       headers=EXTRA_HEADERS).json()
+    events = data.get("events") or []
+    games = []
+    for event in events:
+        competition = (event.get("competitions") or [{}])[0]
+        status = (competition.get("status") or {}).get("type") or {}
+        if status.get("name") in ("STATUS_POSTPONED", "STATUS_CANCELED"):
+            continue
+        if not status.get("completed") and not force:
+            return None
+        teams = sorted(competition.get("competitors", []), key=lambda t: not t.get("winner"))
+        if len(teams) != 2:
+            continue
+        won, lost = teams
+        extra = status.get("shortDetail", "")
+        if not status.get("completed"):
+            games.append(f"{html.escape(won['team']['shortDisplayName'])} vs {html.escape(lost['team']['shortDisplayName'])}"
+                         f" (not final: {html.escape(extra)})")
+            continue
+        line = (f"<b>{html.escape(won['team']['shortDisplayName'])} {html.escape(str(won.get('score', '')))}</b>, "
+                f"{html.escape(lost['team']['shortDisplayName'])} {html.escape(str(lost.get('score', '')))}")
+        if "OT" in extra:
+            line += f" ({html.escape(extra.split('/')[-1].strip())})"
+        notes = [n.get("headline", "") for n in competition.get("notes", []) if n.get("headline")]
+        series = (competition.get("series") or {}).get("summary")
+        tag = " · ".join(html.escape(t) for t in notes + ([series] if series else []))
+        if tag and "Group Play" not in tag:  # cup knockouts and playoff series matter; group play is every game
+            line += f"\n   <i>{tag}</i>"
+        games.append(line)
+    if not games:
+        return None
+    caption = f"🏀 <b>NBA SCORES</b> · {day.strftime('%a, %b')} {day.day}\n<blockquote>" + "\n".join(games) + "</blockquote>"
+    try:
+        standings = nba_standings(session)
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        standings = []
+    if standings:
+        caption += "\n<b>Standings</b>\n<blockquote expandable>" + "\n".join(html.escape(s) for s in standings) + "</blockquote>"
+    return caption
+
+
+def check_nba_scores(session, tg, cfg, state):
+    """Once every game of a US night is final, post all the scores (winners in bold) plus standings."""
+    settings = cfg.get("nba_scores") or {}
+    if not settings:
+        return
+    done = state.setdefault("nba_scores", [])
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    for day in (today - timedelta(days=1), today):  # US nights end after midnight UTC
+        stamp = day.isoformat()
+        if stamp in done:
+            continue
+        # By 15:00 UTC (10 AM ET) the night is long over: don't let one stuck game hold the digest back.
+        caption = nba_digest(session, day, force=day < today and now.hour >= 15)
+        if not caption:
+            continue
+        topic_id = extra_topic(tg, state, "nba_scores", settings.get("topic", "NBA Scores"))
+        tg.post(topic_id, "NBA", {"id": f"nba-{stamp}", "text": "NBA scores", "caption": caption,
+                                  "url": f"https://www.espn.com/nba/scoreboard/_/date/{day.strftime('%Y%m%d')}",
+                                  "button": "Box scores on ESPN ↗", "media": []})
+        done.append(stamp)
+        del done[:-14]
+        save_state(state)
+        log.info("NBA scores for %s posted", stamp)
+
+
+def run_extras(session, tg, cfg, state):
+    for name, check in (("episodes", check_episodes), ("nba_scores", check_nba_scores)):
+        try:
+            check(session, tg, cfg, state)
+        except Exception:
+            log.exception("%s check failed", name)
+
+
 def single_instance():
     lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     port = 47833 + zlib.crc32(CONFIG_PATH.name.encode()) % 1000
@@ -1200,6 +1389,7 @@ def main():
     if state.get("chat_id") != chat_id:
         state["chat_id"] = chat_id
         state["topics"] = {}
+        state.pop("extra_topics", None)
         save_state(state)
     # Accounts removed from the config: forget them, so re-adding one later gets a fresh topic.
     for account in [a for a in state.get("topics", {}) if a not in cfg["accounts"]]:
@@ -1220,13 +1410,18 @@ def main():
                 check_account(session, tg, cfg, state, account)
             except Exception:
                 log.exception("@%s check failed", account)
+        run_extras(session, tg, cfg, state)
         return
 
     interval = cfg["poll_interval_seconds"]
     step = min(10, interval / len(cfg["accounts"]))
     due = {account: time.monotonic() + i * step for i, account in enumerate(cfg["accounts"])}
     log.info("Watching %s accounts every %s seconds", len(due), interval)
+    next_extras = time.monotonic()
     while True:
+        if time.monotonic() >= next_extras:
+            run_extras(session, tg, cfg, state)
+            next_extras = time.monotonic() + interval
         account = min(due, key=due.get)
         time.sleep(max(0, due[account] - time.monotonic()))
         try:
